@@ -3,16 +3,16 @@ extern crate log;
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use glommio::{
-    net::TcpListener, sync::Semaphore, timer::TimerActionRepeat, CpuSet, Latency,
-    LocalExecutorPoolBuilder, PoolPlacement, Shares, io::ImmutableFileBuilder,
+    io::ImmutableFileBuilder, net::TcpListener, sync::Semaphore, timer::TimerActionRepeat, CpuSet,
+    Latency, LocalExecutorPoolBuilder, PoolPlacement, Shares,
 };
+use speedy::Writable;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     rc::Rc,
     time::{Duration, Instant},
 };
-use speedy::Writable;
 
 type Key = u64;
 type Db = Rc<RefCell<HashMap<u64, Vec<u8>>>>;
@@ -26,7 +26,7 @@ async fn serve() {
 
     let db: Db = Rc::new(RefCell::new(HashMap::new()));
     let db2 = db.clone();
-    let db3= db.clone();
+    let db3 = db.clone();
 
     let expirations: Rc<RefCell<BTreeMap<Expiration, Key>>> =
         Rc::new(RefCell::new(BTreeMap::new()));
@@ -45,77 +45,79 @@ async fn serve() {
         "background_queue",
     );
 
-    glommio::spawn_local_into(async move {
-        let action = TimerActionRepeat::repeat(move || {
-            let db_local = db3.clone();
-            let last_snapshot_local = last_snapshot.clone();
-            async move {
+    glommio::spawn_local_into(
+        async move {
+            let action = TimerActionRepeat::repeat(move || {
+                let db_local = db3.clone();
+                let last_snapshot_local = last_snapshot.clone();
+                async move {
+                    let new_snap_filename = format!("snapshot-{id}-{}.db", fastrand::u64(..));
+                    let snapshot = ImmutableFileBuilder::new(&new_snap_filename);
+                    let mut sf = snapshot.build_sink().await.unwrap();
 
-                let new_snap_filename = format!("snapshot-{id}-{}.db", fastrand::u64(..));
-                let snapshot = ImmutableFileBuilder::new(&new_snap_filename);
-                let mut sf = snapshot.build_sink().await.unwrap();
+                    let mut db_g = db_local.borrow_mut();
+                    db_g.shrink_to_fit();
+                    let data = db_g.write_to_vec().unwrap();
 
-                let mut db_g = db_local.borrow_mut();
-                let keys_count = db_g.len();
-                db_g.shrink_to_fit();
-                let data = db_g.write_to_vec().unwrap();
+                    drop(db_g);
 
-                drop(db_g);
-                
-                glommio::yield_if_needed().await;
+                    glommio::yield_if_needed().await;
 
-                sf.write(&data).await.unwrap();
-                sf.sync().await.unwrap();
-                sf.seal().await.unwrap();
-                info!("[{id}] Keys count: {keys_count}");
-                glommio::yield_if_needed().await;
+                    sf.write(&data).await.unwrap();
+                    sf.sync().await.unwrap();
+                    sf.seal().await.unwrap();
+                    glommio::yield_if_needed().await;
 
-                let last_snap_fname = last_snapshot_local.borrow().clone();
-                if let Some(fname) = last_snap_fname {
-                    glommio::io::remove(fname).await.unwrap();
+                    let last_snap_fname = last_snapshot_local.borrow().clone();
+                    if let Some(fname) = last_snap_fname {
+                        glommio::io::remove(fname).await.unwrap();
+                    }
+                    *last_snapshot_local.borrow_mut() = Some(new_snap_filename);
+
+                    Some(Duration::from_secs(1))
                 }
-                *last_snapshot_local.borrow_mut() = Some(new_snap_filename);
-
-                Some(Duration::from_secs(1))
-            }
-        });
-        action.join().await;
-    }, backgorund_queue)
+            });
+            action.join().await;
+        },
+        backgorund_queue,
+    )
     .unwrap()
     .detach();
 
-    glommio::spawn_local_into(async move {
-        let action = TimerActionRepeat::repeat(move || {
-            let expirations_local = expirations2.clone();
-            let db_local = db2.clone();
-            async move {
-                let now = Instant::now();
-                loop {
-                    let (expiration, key) = match expirations_local.borrow().iter().next() {
-                        Some((&expiration, &key)) => (expiration, key),
-                        None => break,
-                    };
+    glommio::spawn_local_into(
+        async move {
+            let action = TimerActionRepeat::repeat(move || {
+                let expirations_local = expirations2.clone();
+                let db_local = db2.clone();
+                async move {
+                    let now = Instant::now();
+                    loop {
+                        let (expiration, key) = match expirations_local.borrow().iter().next() {
+                            Some((&expiration, &key)) => (expiration, key),
+                            None => break,
+                        };
 
-                    if expiration > now {
-                        return Some(Duration::from_millis(5));
+                        if expiration > now {
+                            return Some(Duration::from_millis(5));
+                        }
+
+                        db_local.borrow_mut().remove(&key);
+                        expirations_local.borrow_mut().remove(&expiration);
+                        glommio::yield_if_needed().await;
                     }
 
-                    db_local.borrow_mut().remove(&key);
-                    expirations_local.borrow_mut().remove(&expiration);
-                    debug!("[{id}] Expired key {key}");
-                    glommio::yield_if_needed().await;
+                    Some(Duration::from_millis(10))
                 }
-
-                Some(Duration::from_millis(10))
-            }
-        });
-        action.join().await;
-    }, backgorund_queue)
+            });
+            action.join().await;
+        },
+        backgorund_queue,
+    )
     .unwrap()
     .detach();
 
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    info!("[{id}] Listening on {}", listener.local_addr().unwrap());
+    let listener = TcpListener::bind("0.0.0.0:6379").unwrap();
+    info!("[{id}] Listening on {:?}", listener.local_addr().unwrap());
 
     let semaphore = Rc::new(Semaphore::new(2048));
 
@@ -125,7 +127,6 @@ async fn serve() {
         let mut stream = listener.accept().await.unwrap();
         let local_db = db.clone();
         let expirations2 = expirations.clone();
-        debug!("[{id}] Accepted client: {:?}", stream.local_addr());
 
         glommio::spawn_local_into(
             async move {
@@ -134,21 +135,16 @@ async fn serve() {
                     let len = stream.read(&mut buf).await.unwrap();
 
                     if len == 0 {
-                        debug!("[{id}] Connection closed");
                         break;
                     } else {
                         if buf.len() < 1069 {
-                            debug!("[{id}] Frame not complete, continue");
                             continue;
                         }
 
                         let key = fastrand::u64(..);
 
-                        debug!("[{id}] Writing {key}");
-
                         let mut db_guard = local_db.borrow_mut();
                         db_guard.insert(key, Vec::from(buf));
-                        debug!("[{id}] Keys in db: {}", db_guard.len());
                         drop(db_guard);
                         let expire = Instant::now() + Duration::from_secs(KEY_EXPIRE_SEC);
                         let mut queue_guard = expirations2.borrow_mut();
